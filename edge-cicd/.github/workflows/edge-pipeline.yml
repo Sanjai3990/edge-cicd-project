@@ -1,0 +1,205 @@
+# ═══════════════════════════════════════════════════════════════════
+#  CI/CD Pipeline for Edge Computing
+#  File: .github/workflows/edge-pipeline.yml
+#
+#  This pipeline runs automatically on every push or pull request.
+#  It has 4 stages:
+#    1. TEST     → Run unit tests
+#    2. BUILD    → Build Docker image
+#    3. SCAN     → Security scan the image
+#    4. DEPLOY   → Simulate deployment to edge device
+# ═══════════════════════════════════════════════════════════════════
+
+name: Edge CI/CD Pipeline
+
+# ── Triggers ──────────────────────────────────────────────────────
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+# ── Environment Variables ─────────────────────────────────────────
+env:
+  IMAGE_NAME: edge-sensor-node
+  IMAGE_TAG: ${{ github.sha }}        # Unique tag using commit hash
+
+# ═══════════════════════════════════════════════════════════════════
+#  STAGE 1: TEST
+#  Run all unit tests + generate coverage report
+# ═══════════════════════════════════════════════════════════════════
+jobs:
+  test:
+    name: "Stage 1 — Run Unit Tests"
+    runs-on: ubuntu-latest
+
+    steps:
+      # 1a. Download the code from the repo
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 1b. Set up Python environment
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      # 1c. Install project dependencies
+      - name: Install Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      # 1d. Run tests with coverage report
+      - name: Run Tests with Coverage
+        run: |
+          pytest tests/ \
+            --cov=app \
+            --cov-report=term-missing \
+            --cov-report=xml \
+            -v
+
+      # 1e. Upload coverage report as artifact
+      - name: Upload Coverage Report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: coverage.xml
+
+# ═══════════════════════════════════════════════════════════════════
+#  STAGE 2: BUILD
+#  Build the Docker image for the edge device
+# ═══════════════════════════════════════════════════════════════════
+  build:
+    name: "Stage 2 — Build Docker Image"
+    runs-on: ubuntu-latest
+    needs: test                         # Only runs if tests pass ✅
+
+    steps:
+      - name: Checkout Code
+        uses: actions/checkout@v4
+
+      # 2a. Set up Docker Buildx (advanced Docker build tool)
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      # 2b. Build the Docker image
+      - name: Build Docker Image
+        run: |
+          docker build \
+            --tag ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }} \
+            --tag ${{ env.IMAGE_NAME }}:latest \
+            .
+
+      # 2c. Save the built image to a file for next stages
+      - name: Save Docker Image
+        run: docker save ${{ env.IMAGE_NAME }}:latest | gzip > edge-image.tar.gz
+
+      # 2d. Upload image file as artifact
+      - name: Upload Docker Image Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: docker-image
+          path: edge-image.tar.gz
+
+# ═══════════════════════════════════════════════════════════════════
+#  STAGE 3: SCAN (Security)
+#  Scan the Docker image for known vulnerabilities
+# ═══════════════════════════════════════════════════════════════════
+  scan:
+    name: "Stage 3 — Security Scan"
+    runs-on: ubuntu-latest
+    needs: build                         # Only runs if build passes ✅
+
+    steps:
+      - name: Download Docker Image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker Image
+        run: docker load < edge-image.tar.gz
+
+      # 3a. Scan image with Trivy (free security scanner)
+      - name: Run Trivy Security Scan
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: "${{ env.IMAGE_NAME }}:latest"
+          format: "table"
+          exit-code: "0"               # Don't fail pipeline, just report
+          severity: "CRITICAL,HIGH"
+
+# ═══════════════════════════════════════════════════════════════════
+#  STAGE 4: DEPLOY (Simulated Edge Deployment)
+#  Simulate pushing the image to an edge device
+#  In production: replace this with SSH deploy to real edge device
+# ═══════════════════════════════════════════════════════════════════
+  deploy:
+    name: "Stage 4 — Deploy to Edge"
+    runs-on: ubuntu-latest
+    needs: scan                          # Only runs if scan passes ✅
+    if: github.ref == 'refs/heads/main'  # Only deploy from main branch
+
+    steps:
+      - name: Download Docker Image
+        uses: actions/download-artifact@v4
+        with:
+          name: docker-image
+
+      - name: Load Docker Image
+        run: docker load < edge-image.tar.gz
+
+      # 4a. Simulate edge deployment
+      - name: Simulate Edge Deployment
+        run: |
+          echo "════════════════════════════════════════"
+          echo "  Deploying to Edge Device: edge-node-001"
+          echo "  Image: ${{ env.IMAGE_NAME }}:${{ env.IMAGE_TAG }}"
+          echo "  Commit: ${{ github.sha }}"
+          echo "  Branch: ${{ github.ref_name }}"
+          echo "════════════════════════════════════════"
+
+      # 4b. Start the container and verify it's healthy
+      - name: Start Edge Container
+        run: |
+          docker run -d \
+            --name edge-node \
+            --publish 5000:5000 \
+            ${{ env.IMAGE_NAME }}:latest
+
+      # 4c. Wait for container to start
+      - name: Wait for Container to Start
+        run: sleep 5
+
+      # 4d. Health check — verify the edge service is running
+      - name: Health Check
+        run: |
+          STATUS=$(curl -s -o /dev/null -w "%{http_code}" http://localhost:5000/health)
+          echo "Health check status: $STATUS"
+          if [ "$STATUS" != "200" ]; then
+            echo "Health check FAILED!"
+            exit 1
+          fi
+          echo "Health check PASSED ✅"
+
+      # 4e. Test sensor endpoints
+      - name: Test Sensor Endpoints
+        run: |
+          echo "Testing /sensors endpoint..."
+          curl -s http://localhost:5000/sensors | python3 -m json.tool
+          echo ""
+          echo "Testing /alerts endpoint..."
+          curl -s http://localhost:5000/alerts | python3 -m json.tool
+
+      # 4f. Deployment success summary
+      - name: Deployment Summary
+        run: |
+          echo ""
+          echo "✅ Deployment SUCCESSFUL!"
+          echo "Edge node is live at: http://edge-node-001:5000"
+          echo "Commit deployed: ${{ github.sha }}"
+          echo "Deployed by: ${{ github.actor }}"
+          echo "Time: $(date -u)"
